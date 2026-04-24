@@ -1,0 +1,208 @@
+-- |
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+--
+module Audit.ComplianceReport where
+
+import Daml.Script
+import DA.Date (Date)
+import DA.Time (Time)
+import DA.Assert ((===))
+
+import Audit.AuditEntry (AuditEntry)
+
+-- | Defines the status of a compliance report throughout its lifecycle.
+data ReportStatus
+  = Pending   -- ^ Report created by the entity, awaiting review by the compliance officer.
+  | Approved  -- ^ Report reviewed and approved by the compliance officer, visible to the regulator.
+  deriving (Eq, Show)
+
+-- | A compliance report that aggregates multiple AuditEntry contracts for a specific
+-- | reporting period. It follows a workflow from Pending to Approved.
+-- | The `regulator` is an observer and can fetch the report and all linked `AuditEntry`
+-- | contracts, providing a complete, attested view of the period's activities.
+template ComplianceReport
+  with
+    entity             : Party
+      -- ^ The regulated entity that generated the report.
+    complianceOfficer  : Party
+      -- ^ The internal compliance officer responsible for approving the report.
+    regulator          : Party
+      -- ^ The external regulator who observes the final, approved report.
+    reportId           : Text
+      -- ^ A unique identifier for this report (e.g., "Q4-2024-AML").
+    reportingPeriodStart : Date
+      -- ^ The start date of the reporting period (inclusive).
+    reportingPeriodEnd   : Date
+      -- ^ The end date of the reporting period (inclusive).
+    status             : ReportStatus
+      -- ^ The current status of the report in its lifecycle.
+    auditEntryCids     : [ContractId AuditEntry]
+      -- ^ A list of contract IDs for the audit entries included in this report.
+    createdAt          : Time
+      -- ^ The timestamp when this version of the report contract was created.
+  where
+    signatory case status of
+      Pending  -> [entity]
+      Approved -> [entity, complianceOfficer]
+
+    observer regulator
+
+    -- The combination of the entity and report ID must be unique for active reports.
+    key (entity, reportId) : (Party, Text)
+    maintainer key._1
+
+    ensure
+      -- Basic sanity checks on the report data and party roles.
+      reportingPeriodStart <= reportingPeriodEnd
+        && entity /= complianceOfficer
+        && entity /= regulator
+        && complianceOfficer /= regulator
+
+    -- | Choice for the Compliance Officer to approve the report.
+    -- | This archives the 'Pending' report and creates a new 'Approved' one, making the
+    -- | approval an immutable event on the ledger. The compliance officer becomes a
+    -- | signatory on the new `Approved` report, attesting to its correctness.
+    choice Approve : ContractId ComplianceReport
+      with
+        approvalTime: Time
+          -- ^ The timestamp of the approval.
+      controller complianceOfficer
+      do
+        -- Ensure the report is in the correct state to be approved.
+        status === Pending
+
+        -- Ensure the approval time is after the creation time of the pending report.
+        assertMsg "Approval time must be after report creation time" (approvalTime > createdAt)
+
+        create this with
+          status = Approved
+          createdAt = approvalTime
+
+    -- | Choice for the Compliance Officer to reject the report.
+    -- | This archives the `Pending` report, requiring the entity to create a new, corrected version.
+    choice Reject : ()
+      with
+        reason: Text
+          -- ^ The reason for rejecting the report, for off-ledger communication or a separate log.
+      controller complianceOfficer
+      do
+        status === Pending
+
+        -- In a production application, this rejection event could be recorded
+        -- on another contract for tracking purposes, creating a rejection audit trail.
+        -- For this example, we simply archive the report. The `reason` field is captured
+        -- in the transaction stream for auditability even without creating a new contract.
+        pure ()
+
+    -- | Choice for the entity to archive an approved report after it is no longer
+    -- | considered active, e.g., after the end of a regulatory retention period.
+    choice ArchiveReport : ()
+      controller entity
+      do
+        status === Approved
+
+        -- In a real-world scenario, you might add a check here to ensure a certain
+        -- amount of time has passed since the approval or the end of the reporting period,
+        -- enforcing a minimum retention policy on-ledger.
+        pure ()
+
+
+-- === Scenarios for testing and demonstrating the workflow ===
+
+setupParties : Script (Party, Party, Party)
+setupParties = script do
+  entity <- allocateParty "RegulatedEntity"
+  compliance <- allocateParty "ComplianceOfficer"
+  regulator <- allocateParty "Regulator"
+  pure (entity, compliance, regulator)
+
+-- | Test the successful creation and approval of a compliance report.
+test_report_approval_flow : Script ()
+test_report_approval_flow = script do
+  (entity, compliance, regulator) <- setupParties
+  now <- getTime
+
+  -- 1. Entity creates some audit entries to be included in the report.
+  entryCid1 <- submit entity do
+    create AuditEntry with
+      actor = entity
+      observers = [regulator]
+      eventId = "TXN-001"
+      eventType = "ClientOnboarding"
+      eventTimestamp = now
+      payload = "{\"clientId\": \"C-123\", \"riskScore\": \"Low\"}"
+      payloadHash = "hash-of-payload-1"
+
+  entryCid2 <- submit entity do
+    create AuditEntry with
+      actor = entity
+      observers = [regulator]
+      eventId = "TXN-002"
+      eventType = "LargeTransaction"
+      eventTimestamp = now
+      payload = "{\"fromAccount\": \"A-456\", \"toAccount\": \"B-789\", \"amount\": 50000.0}"
+      payloadHash = "hash-of-payload-2"
+
+  -- 2. Entity creates and submits the compliance report.
+  let reportPeriodStart = date 2024 Jan 1
+  let reportPeriodEnd = date 2024 Mar 31
+
+  pendingReportCid <- submit entity do
+    create ComplianceReport with
+      entity
+      complianceOfficer = compliance
+      regulator
+      reportId = "Q1-2024-Report"
+      reportingPeriodStart = reportPeriodStart
+      reportingPeriodEnd = reportPeriodEnd
+      status = Pending
+      auditEntryCids = [entryCid1, entryCid2]
+      createdAt = now
+
+  -- 3. Compliance Officer approves the report.
+  approvalTime <- addRelTime now (seconds 60)
+  approvedReportCid <- submit compliance do
+    exercise pendingReportCid Approve with approvalTime
+
+  -- 4. Verify the new report state.
+  approvedReport <- fetch approvedReportCid
+  approvedReport.status === Approved
+  signatories approvedReport === fromList [entity, compliance]
+
+  -- 5. Entity archives the report after some time.
+  submit entity do
+    exercise approvedReportCid ArchiveReport
+
+  -- Verify the report is no longer active.
+  isActive <- queryContractId entity approvedReportCid
+  isActive === None
+  pure ()
+
+-- | Test the rejection of a compliance report.
+test_report_rejection_flow : Script ()
+test_report_rejection_flow = script do
+  (entity, compliance, regulator) <- setupParties
+  now <- getTime
+
+  -- 1. Entity creates a report.
+  pendingReportCid <- submit entity do
+    create ComplianceReport with
+      entity
+      complianceOfficer = compliance
+      regulator
+      reportId = "Q2-2024-Report-Flawed"
+      reportingPeriodStart = date 2024 Apr 1
+      reportingPeriodEnd = date 2024 Jun 30
+      status = Pending
+      auditEntryCids = [] -- Report is missing entries
+      createdAt = now
+
+  -- 2. Compliance Officer rejects the report.
+  submit compliance do
+    exercise pendingReportCid Reject with reason = "Report is missing required audit entries."
+
+  -- 3. Verify the report has been archived.
+  isActive <- queryContractId entity pendingReportCid
+  isActive === None
+  pure ()
