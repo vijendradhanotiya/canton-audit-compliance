@@ -1,0 +1,73 @@
+-- |
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+--
+
+module Audit.RegulatorView where
+
+import DA.Time (Time)
+import DA.Optional (traverse)
+
+import Audit.AuditEntry (AuditEntry)
+import Audit.ComplianceReport (ComplianceReport)
+
+-- | A `RegulatorView` contract serves as a formal, auditable disclosure mechanism.
+-- A regulated `entity` creates this contract to grant a `regulator` access to a
+-- specific set of audit entries or a compliance report. This approach enhances
+-- privacy by ensuring the regulator only sees the data explicitly shared with them,
+-- rather than having broad access to the entity's ledger.
+--
+-- The core of the privacy model relies on the `entity` adding the `regulator` as
+-- an observer on the underlying `AuditEntry` or `ComplianceReport` contracts
+-- *before* creating this `RegulatorView`. This contract then acts as a pointer
+-- or a "cover letter" for the disclosed data, providing context and a formal
+-- acknowledgement mechanism.
+template RegulatorView
+  with
+    entity : Party
+      -- ^ The regulated entity disclosing the information.
+    regulator : Party
+      -- ^ The regulatory body receiving the information.
+    disclosureReason : Text
+      -- ^ The purpose of the disclosure (e.g., "Quarterly AML Filing", "Response to Inquiry #XYZ-123").
+    disclosedAt : Time
+      -- ^ The timestamp of when the disclosure was made.
+    auditEntryCids : [ContractId AuditEntry]
+      -- ^ A list of `AuditEntry` contract IDs being disclosed.
+    reportCid : Optional (ContractId ComplianceReport)
+      -- ^ An optional `ComplianceReport` contract ID being disclosed.
+  where
+    signatory entity
+    observer regulator
+
+    choice AcknowledgeReceipt : ()
+      -- | Allows the regulator to formally acknowledge they have received and reviewed
+      -- the disclosed data. Exercising this choice archives the `RegulatorView`
+      -- contract, signifying that the disclosure-and-receipt workflow for this
+      -- specific set of data is complete.
+      controller regulator
+      do
+        return ()
+
+    nonconsuming choice GetDisclosedEntryPayloads : [AuditEntry]
+      -- | A convenience choice for the regulator to fetch the full payloads of the
+      -- disclosed `AuditEntry` contracts.
+      --
+      -- IMPORTANT: This choice will fail at runtime if the `regulator` is not an
+      -- observer on each of the underlying `AuditEntry` contracts referenced in
+      -- `auditEntryCids`. It is the responsibility of the `entity` to grant these
+      -- observation rights prior to creating the `RegulatorView`.
+      controller regulator
+      do
+        mapA fetch auditEntryCids
+
+    nonconsuming choice GetDisclosedReportPayload : Optional ComplianceReport
+      -- | A convenience choice for the regulator to fetch the full payload of the
+      -- disclosed `ComplianceReport` contract, if one was provided.
+      --
+      -- IMPORTANT: This choice will fail at runtime if the `regulator` is not an
+      -- observer on the underlying `ComplianceReport` contract referenced in
+      -- `reportCid`.
+      controller regulator
+      do
+        traverse fetch reportCid
