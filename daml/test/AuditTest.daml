@@ -1,0 +1,224 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module AuditTest where
+
+import Daml.Script
+import DA.Date as Date
+import DA.Time (time)
+import DA.Assert
+
+import AuditEntry
+import ComplianceReport
+import RegulatorView
+import RetentionPolicy
+
+-- === Test Setup ===
+
+-- A helper record to hold the parties for a test scenario.
+data TestParties = TestParties
+  { entity: Party
+  , complianceOfficer: Party
+  , regulator: Party
+  , anotherEntity: Party
+  }
+
+-- Allocates parties required for the tests.
+testSetup : Script TestParties
+testSetup = do
+  entity <- allocatePartyWithHint "RegulatedEntity" (PartyIdHint "regulated-entity")
+  complianceOfficer <- allocatePartyWithHint "ComplianceOfficer" (PartyIdHint "compliance-officer")
+  regulator <- allocatePartyWithHint "Regulator" (PartyIdHint "regulator")
+  anotherEntity <- allocatePartyWithHint "AnotherEntity" (PartyIdHint "another-entity")
+  return TestParties with ..
+
+-- === Test Cases ===
+
+-- Test the basic lifecycle of an AuditEntry: creation and archival.
+testAuditEntryLifecycle : Script ()
+testAuditEntryLifecycle = do
+  TestParties{entity, complianceOfficer} <- testSetup
+  now <- getTime
+  let eventData = "{\"transactionId\": \"txn-123\", \"amount\": 1000.0, \"currency\": \"USD\"}"
+
+  -- 1. The regulated entity creates a new audit entry.
+  entryCid <- submit entity do
+    createCmd AuditEntry with
+      entity
+      complianceOfficer
+      eventType = "TRADE_EXECUTION"
+      eventTimestamp = now
+      eventData
+      retentionPolicyId = None
+
+  -- 2. Verify the created entry has the correct data.
+  entry <- fetch entryCid
+  entry.entity === entity
+  entry.complianceOfficer === complianceOfficer
+  entry.eventType === "TRADE_EXECUTION"
+  entry.eventData === eventData
+
+  -- 3. The entity, as the signatory, archives the entry.
+  submit entity do
+    exerciseCmd entryCid ArchiveEntry
+
+  -- 4. Verify the contract is no longer active.
+  query @AuditEntry entity >>= \contracts ->
+    contracts === []
+
+  return ()
+
+-- Test the generation of a compliance report from multiple audit entries.
+testComplianceReportGeneration : Script ()
+testComplianceReportGeneration = do
+  TestParties{entity, complianceOfficer} <- testSetup
+  now <- getTime
+
+  -- 1. The entity creates several audit entries.
+  entryCid1 <- submit entity do createCmd AuditEntry with entity, complianceOfficer, eventType = "CLIENT_ONBOARDING", eventTimestamp = now, eventData = "{}", retentionPolicyId = None
+  entryCid2 <- submit entity do createCmd AuditEntry with entity, complianceOfficer, eventType = "FUNDS_DEPOSIT", eventTimestamp = now, eventData = "{}", retentionPolicyId = None
+  entryCid3 <- submit entity do createCmd AuditEntry with entity, complianceOfficer, eventType = "TRADE_EXECUTION", eventTimestamp = now, eventData = "{}", retentionPolicyId = None
+
+  -- 2. The compliance officer generates a report including all three entries.
+  let includedEntries = [entryCid1, entryCid2, entryCid3]
+  let reportReason = "Quarterly review for all client activities."
+
+  reportCid <- submit complianceOfficer do
+    exerciseCmd entryCid1 GenerateComplianceReport with
+      includedEntryIds = includedEntries
+      reason = reportReason
+
+  -- 3. Verify the report was created correctly.
+  report <- fetch reportCid
+  report.entity === entity
+  report.complianceOfficer === complianceOfficer
+  report.reason === reportReason
+  report.sourceEntryIds === includedEntries
+
+  return ()
+
+-- Test granting a regulator a view over a specific audit entry.
+testRegulatorViewAccess : Script ()
+testRegulatorViewAccess = do
+  TestParties{entity, complianceOfficer, regulator} <- testSetup
+  now <- getTime
+
+  -- 1. An audit entry is created.
+  entryCid <- submit entity do createCmd AuditEntry with entity, complianceOfficer, eventType = "HIGH_VALUE_TX", eventTimestamp = now, eventData = "{\"amount\": 500000.0}", retentionPolicyId = None
+
+  -- 2. The compliance officer grants the regulator access to this entry.
+  let accessReason = "Regulatory inquiry #REG-556."
+  viewCid <- submit complianceOfficer do
+    exerciseCmd entryCid GrantRegulatorView with
+      regulator
+      reason = accessReason
+
+  -- 3. Verify the RegulatorView contract was created and is visible to the regulator.
+  viewContract <- fetch viewCid
+  viewContract.regulator === regulator
+  viewContract.complianceOfficer === complianceOfficer
+  viewContract.entity === entity
+  viewContract.originalEntryData.eventType === "HIGH_VALUE_TX"
+  viewContract.reason === accessReason
+
+  -- 4. The regulator acknowledges receipt, which archives the view.
+  submit regulator do
+    exerciseCmd viewCid AcknowledgeReceipt
+
+  -- 5. Verify the view is archived but the original entry remains.
+  query @RegulatorView regulator >>= \contracts -> contracts === []
+  (Some _) <- query @AuditEntry entity
+  return ()
+
+-- Test the creation and linking of a RetentionPolicy.
+testRetentionPolicyLinking : Script ()
+testRetentionPolicyLinking = do
+  TestParties{entity, complianceOfficer} <- testSetup
+  now <- getTime
+  let policyStartDate = Date.fromGregorian 2024 Date.Jan 1
+  let retentionPeriodDays = 1825 -- 5 years
+
+  -- 1. Entity establishes a retention policy.
+  policyCid <- submit entity do
+    createCmd RetentionPolicy with
+      entity
+      complianceOfficer
+      policyStartDate
+      retentionPeriodDays
+      policyDescription = "Standard 5-year data retention for trade data."
+
+  -- 2. Entity creates a new audit entry and links it to the policy.
+  entryCid <- submit entity do
+    createCmd AuditEntry with
+      entity
+      complianceOfficer
+      eventType = "POLICY_LINKED_TRADE"
+      eventTimestamp = now
+      eventData = "{}"
+      retentionPolicyId = Some policyCid
+
+  -- 3. Verify the link is correctly established.
+  entry <- fetch entryCid
+  entry.retentionPolicyId === Some policyCid
+
+  return ()
+
+
+-- Test authorization rules to ensure choices can only be exercised by the correct parties.
+testAuthorizationFailures : Script ()
+testAuthorizationFailures = do
+  TestParties{entity, complianceOfficer, regulator, anotherEntity} <- testSetup
+  now <- getTime
+
+  -- 1. Create a base AuditEntry for testing choices.
+  entryCid <- submit entity do
+    createCmd AuditEntry with
+      entity
+      complianceOfficer
+      eventType = "AUTH_TEST"
+      eventTimestamp = now
+      eventData = "{}"
+      retentionPolicyId = None
+
+  -- 2. Another entity must fail to create an entry on behalf of the main entity.
+  submitMustFail anotherEntity do
+    createCmd AuditEntry with
+      entity = entity -- Attempting to create for someone else
+      complianceOfficer
+      eventType = "SPOOFED_ENTRY"
+      eventTimestamp = now
+      eventData = "{}"
+      retentionPolicyId = None
+
+  -- 3. The entity must fail to generate a compliance report (only officer can).
+  submitMustFail entity do
+    exerciseCmd entryCid GenerateComplianceReport with
+      includedEntryIds = [entryCid]
+      reason = "Self-generated report"
+
+  -- 4. The regulator must fail to generate a compliance report.
+  submitMustFail regulator do
+    exerciseCmd entryCid GenerateComplianceReport with
+      includedEntryIds = [entryCid]
+      reason = "Regulator-generated report"
+
+  -- 5. The entity must fail to grant regulator access (only officer can).
+  submitMustFail entity do
+    exerciseCmd entryCid GrantRegulatorView with
+      regulator
+      reason = "Direct grant from entity"
+
+  return ()
+
+
+-- Main test suite that groups all individual tests.
+auditTests : Script ()
+auditTests = do
+  testGroup "Audit & Compliance Workflow Tests" do
+    [ ("testAuditEntryLifecycle", testAuditEntryLifecycle)
+    , ("testComplianceReportGeneration", testComplianceReportGeneration)
+    , ("testRegulatorViewAccess", testRegulatorViewAccess)
+    , ("testRetentionPolicyLinking", testRetentionPolicyLinking)
+    , ("testAuthorizationFailures", testAuthorizationFailures)
+    ]
+  return ()
