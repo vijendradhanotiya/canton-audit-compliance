@@ -1,0 +1,29 @@
+sdk-version: 3.4.0
+name: canton-audit-compliance
+version: 0.1.0
+source: daml
+dependencies:
+  - daml-prim
+  - daml-stdlib
+  - daml-script
+data-dependencies:
+  - .daml/dist/daml-finance-interface-issuance-2.1.2.dar
+  - .daml/dist/daml-finance-interface-settlement-2.1.2.dar
+  - .daml/dist/daml-finance-interface-types-common-2.1.2.dar
+codegen:
+  js:
+    output-dir: daml.js
+    npm-scope: daml.js
+    include:
+      - Daml.Finance.Interface.*.*
+      - Audit.Log.*
+      - Audit.Compliance.*
+      - Audit.Regulator.*
+  alpha-typescript:
+    output-dir: daml.ts
+    npm-scope: daml.ts
+    include:
+      - Daml.Finance.Interface.*.*
+      - Audit.Log.*
+      - Audit.Compliance.*
+      - Audit.Regulator.*
