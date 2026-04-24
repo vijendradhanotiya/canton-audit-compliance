@@ -1,0 +1,97 @@
+-- |
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+--
+module Canton.AuditCompliance.RetentionPolicy where
+
+import DA.Date (addDays, fromTimeUTC, toDateUTC)
+import DA.Time (Time)
+import DA.Assert ((assertMsg))
+
+-- | Defines a data retention policy for an entity.
+-- This contract ensures that associated data, such as `AuditEntry` contracts,
+-- are not archived before a specified period has elapsed.
+template RetentionPolicy
+  with
+    entity : Party
+      -- ^ The regulated entity subject to the policy.
+    regulator : Party
+      -- ^ The regulatory body that oversees the entity and the policy.
+    policyId : Text
+      -- ^ A unique identifier for this policy within the entity's scope.
+    description : Text
+      -- ^ A human-readable description of the policy's purpose and scope.
+    retentionPeriodDays : Int
+      -- ^ The mandatory retention period in days from the creation of an auditable item.
+    createdAt : Time
+      -- ^ The timestamp when this policy was created.
+  where
+    signatory entity
+    observer regulator
+
+    key (entity, policyId) : (Party, Text)
+    maintainer key._1
+
+    -- | A regulated entity can propose to archive a policy, for example if it's superseded
+    -- by a new one. This requires the regulator's approval.
+    choice ProposeArchive : ContractId RetentionPolicyArchiveProposal
+      controller entity
+      do
+        create RetentionPolicyArchiveProposal with
+          policyCid = self
+          policy = this
+          proposer = entity
+          approver = regulator
+
+    -- | Non-consuming choice that can be called by other contracts to verify if a given
+    -- timestamp is outside the retention period. This is the core enforcement mechanism.
+    nonconsuming choice AssertCanArchive : ()
+      -- ^ Checks if an item created at a given timestamp is now outside its retention period.
+      -- The transaction will fail if the retention period has not yet passed.
+      with
+        itemTimestamp : Time
+          -- ^ The timestamp of the item being checked (e.g., the `createdAt` of an `AuditEntry`).
+        currentTime : Time
+          -- ^ The current ledger time, passed in to make the check explicit and testable.
+      controller entity, regulator
+      do
+        -- Calculate the date when the item is no longer under retention.
+        let expiryDate = toDateUTC $ addDays (fromTimeUTC itemTimestamp) (convert retentionPeriodDays)
+        let currentDate = toDateUTC currentTime
+
+        assertMsg
+          ("Retention period of " <> show retentionPeriodDays <> " days has not yet passed for the item. " <>
+           "Item created at " <> show itemTimestamp <> " must be retained until at least " <>
+           show expiryDate <> ". Current date is " <> show currentDate <> ".")
+          (currentDate >= expiryDate)
+
+-- | Proposal to archive a `RetentionPolicy`, requiring the regulator's approval.
+-- This ensures that policies governing data retention cannot be removed unilaterally.
+template RetentionPolicyArchiveProposal
+  with
+    policyCid : ContractId RetentionPolicy
+      -- ^ The `RetentionPolicy` contract to be archived.
+    policy : RetentionPolicy
+      -- ^ The data of the policy, for informational purposes in the proposal.
+    proposer : Party
+      -- ^ The entity who proposed the archival.
+    approver : Party
+      -- ^ The regulator who must approve the archival.
+  where
+    signatory proposer
+    observer approver
+
+    choice Reject : ()
+      -- ^ The regulator rejects the proposal to archive the policy.
+      controller approver
+      do
+        -- The proposal is simply archived, leaving the original policy active.
+        pure ()
+
+    choice Accept : ()
+      -- ^ The regulator approves the archival of the policy.
+      controller approver
+      do
+        -- This archives both the original policy and this proposal.
+        archive policyCid
+        pure ()
