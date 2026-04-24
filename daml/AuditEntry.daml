@@ -1,0 +1,50 @@
+-- |
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+--
+
+module AuditEntry where
+
+import DA.Time (Time)
+import DA.Text (Text)
+
+-- | Represents a single, immutable audit log entry.
+-- This contract is created by a 'recorder' (e.g., a regulated firm) to log an
+-- action performed by an 'actor' (e.g., an employee, a client, or an automated system).
+-- The entry is signed by both the recorder and the actor to ensure authenticity and
+-- non-repudiation. Observers, such as compliance officers or regulators, can be
+-- granted viewing rights to specific entries.
+template AuditEntry
+  with
+    recorder       : Party
+      -- ^ The party recording the event, typically the regulated entity.
+    actor          : Party
+      -- ^ The party who performed the action being audited.
+    observers      : [Party]
+      -- ^ Parties who can view this audit entry (e.g., compliance, regulators).
+    entryId        : Text
+      -- ^ A unique identifier for this audit entry, scoped to the recorder.
+    eventType      : Text
+      -- ^ A category for the event, e.g., "TRADE_EXECUTION", "CLIENT_UPDATE".
+    eventTimestamp : Time
+      -- ^ The UTC timestamp of when the event occurred.
+    eventPayload   : Text
+      -- ^ Detailed information about the event, often as a serialized JSON string.
+    actorSignature : Text
+      -- ^ An off-ledger cryptographic signature of the eventPayload, produced by the
+      -- actor's private key. This provides an additional layer of non-repudiation.
+
+  where
+    signatory recorder, actor
+    observer observers
+
+    key (recorder, entryId) : (Party, Text)
+    maintainer key._1
+
+    -- | Archives the audit entry.
+    -- This is typically done as part of a data lifecycle management process.
+    -- Only the original recorder of the event can archive it.
+    nonconsuming choice Archive : ()
+      controller recorder
+      do
+        return ()
