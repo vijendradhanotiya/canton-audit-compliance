@@ -1,50 +1,102 @@
--- |
--- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
--- SPDX-License-Identifier: Apache-2.0
---
-
 module AuditEntry where
 
 import DA.Time (Time)
-import DA.Text (Text)
+import DA.Optional (Optional, isNone)
 
 -- | Represents a single, immutable audit log entry.
--- This contract is created by a 'recorder' (e.g., a regulated firm) to log an
--- action performed by an 'actor' (e.g., an employee, a client, or an automated system).
--- The entry is signed by both the recorder and the actor to ensure authenticity and
--- non-repudiation. Observers, such as compliance officers or regulators, can be
--- granted viewing rights to specific entries.
+-- Each entry is linked to the previous one, forming a tamper-evident chain.
+-- This contract is intended to be created via the `AuditLog` controller contract.
 template AuditEntry
   with
-    recorder       : Party
-      -- ^ The party recording the event, typically the regulated entity.
-    actor          : Party
-      -- ^ The party who performed the action being audited.
-    observers      : [Party]
-      -- ^ Parties who can view this audit entry (e.g., compliance, regulators).
-    entryId        : Text
-      -- ^ A unique identifier for this audit entry, scoped to the recorder.
-    eventType      : Text
-      -- ^ A category for the event, e.g., "TRADE_EXECUTION", "CLIENT_UPDATE".
-    eventTimestamp : Time
-      -- ^ The UTC timestamp of when the event occurred.
-    eventPayload   : Text
-      -- ^ Detailed information about the event, often as a serialized JSON string.
-    actorSignature : Text
-      -- ^ An off-ledger cryptographic signature of the eventPayload, produced by the
-      -- actor's private key. This provides an additional layer of non-repudiation.
-
+    operator          : Party
+      -- ^ The regulated entity that created this audit entry.
+    complianceOfficer : Party
+      -- ^ The compliance officer responsible for oversight.
+    regulator         : Party
+      -- ^ The regulator with observation rights.
+    entryId           : Text
+      -- ^ A unique identifier for this event, scoped to the operator.
+    timestamp         : Time
+      -- ^ The UTC timestamp when the event was recorded on the ledger.
+    eventType         : Text
+      -- ^ A category for the event, e.g., "TRADE_CONFIRMATION", "CLIENT_ONBOARDING".
+    eventPayload      : Text
+      -- ^ The detailed content of the event, typically a JSON string.
+    previousEntryCid  : Optional (ContractId AuditEntry)
+      -- ^ The immutability guard. A link to the previous entry in the log for this operator.
+      -- This is `None` for the very first entry.
   where
-    signatory recorder, actor
-    observer observers
+    signatory operator
+    observer complianceOfficer, regulator
 
-    key (recorder, entryId) : (Party, Text)
+    key (operator, entryId) : (Party, Text)
     maintainer key._1
 
-    -- | Archives the audit entry.
-    -- This is typically done as part of a data lifecycle management process.
-    -- Only the original recorder of the event can archive it.
-    nonconsuming choice Archive : ()
-      controller recorder
+    ensure
+      length entryId > 0 &&
+      length eventType > 0
+
+    nonconsuming choice GetPayload : Text
+      -- ^ Allows authorized parties to retrieve the event payload.
+      controller operator, complianceOfficer, regulator
+      do return eventPayload
+
+-- | A controller contract that manages the audit log for a specific operator.
+-- It maintains a pointer to the most recent AuditEntry, ensuring the integrity
+-- of the chain when new entries are added.
+template AuditLog
+  with
+    operator          : Party
+      -- ^ The regulated entity that owns this audit log.
+    complianceOfficer : Party
+      -- ^ The compliance officer for the operator.
+    regulator         : Party
+      -- ^ The regulator observing the operator.
+    latestEntryCid    : Optional (ContractId AuditEntry)
+      -- ^ A pointer to the most recent `AuditEntry` contract in the chain.
+  where
+    signatory operator
+    observer complianceOfficer, regulator
+
+    key operator : Party
+    maintainer key
+
+    -- | Records a new event in the audit log. This choice atomically creates a
+    -- new `AuditEntry`, links it to the previous one, and updates this controller
+    -- to point to the new entry. This creates an immutable, verifiable chain.
+    choice LogEvent : ContractId AuditLog
+      with
+        entryId      : Text
+          -- ^ A unique identifier for the new event.
+        eventType    : Text
+          -- ^ The category of the new event.
+        eventPayload : Text
+          -- ^ The payload of the new event.
+      controller operator
       do
-        return ()
+        -- Ensure the provided entryId is not a duplicate by attempting to fetch it.
+        -- If it exists, the fetchByKey will succeed and the assertion will fail.
+        let existingKey = (operator, entryId)
+        existingEntry <- lookupByKey @AuditEntry existingKey
+        assertMsg ("Audit entry with ID '" <> entryId <> "' already exists for this operator.") (isNone existingEntry)
+
+        -- Get the current ledger time for the new entry's timestamp.
+        now <- getTime
+
+        -- Create the new audit entry, linking it to the previous one. This is the
+        -- core of the immutability guard; each new entry cryptographically commits
+        -- to the full history by referencing the ContractId of its predecessor.
+        newEntryCid <- create AuditEntry with
+          operator = self.operator
+          complianceOfficer = self.complianceOfficer
+          regulator = self.regulator
+          entryId
+          timestamp = now
+          eventType
+          eventPayload
+          previousEntryCid = self.latestEntryCid
+
+        -- Recreate the controller contract, updating the pointer to the new latest entry.
+        -- This archives the current contract and creates a new one in a single atomic transaction,
+        -- preventing any state where the log is inconsistent.
+        create this with latestEntryCid = Some newEntryCid
